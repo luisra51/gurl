@@ -23,15 +23,15 @@ RUN go mod tidy
 
 # Build the application with optimizations for production
 # Create a static binary that works across different architectures
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
+RUN CGO_ENABLED=0 GOOS=linux \
     go build -a -installsuffix cgo -ldflags="-w -s" \
     -o /app/crawler ./cmd/crawler/main.go
 
 # --- Production Stage ---
 FROM alpine:3.18
 
-# Install ca-certificates for HTTPS requests and timezone data
-RUN apk add --no-cache ca-certificates tzdata
+# Install ca-certificates for HTTPS requests, timezone data, and wget for health checks
+RUN apk add --no-cache ca-certificates tzdata wget
 
 # Create non-root user for security
 RUN addgroup -g 1001 -S appgroup && \
