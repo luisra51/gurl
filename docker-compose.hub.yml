@@ -1,0 +1,56 @@
+# Docker Compose for using pre-built Docker Hub image
+# Usage: docker-compose -f docker-compose.hub.yml up -d
+
+services:
+  crawler-app:
+    image: luisra51/gurl:latest
+    container_name: gurl_crawler_service
+    environment:
+      - CRAWLER_MAX_DEPTH=${CRAWLER_MAX_DEPTH:-3}
+      - CRAWLER_DEDUPLICATE_EMAILS=${CRAWLER_DEDUPLICATE_EMAILS:-true}
+      - CACHE_ENABLED=${CACHE_ENABLED:-true}
+      - CACHE_EXPIRATION_MONTHS=${CACHE_EXPIRATION_MONTHS:-12}
+      - ASYNC_ENABLED=${ASYNC_ENABLED:-true}
+      - ASYNC_WORKERS=${ASYNC_WORKERS:-3}
+      - ASYNC_QUEUE_SIZE=${ASYNC_QUEUE_SIZE:-100}
+      - ASYNC_JOB_TIMEOUT_SECONDS=${ASYNC_JOB_TIMEOUT_SECONDS:-300}
+      - ASYNC_WEBHOOK_TIMEOUT_SECONDS=${ASYNC_WEBHOOK_TIMEOUT_SECONDS:-10}
+      - ASYNC_WEBHOOK_RETRIES=${ASYNC_WEBHOOK_RETRIES:-3}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PERSIST_DISK=${REDIS_PERSIST_DISK:-false}
+      - SERVER_PORT=8080
+      - SERVER_HOST=0.0.0.0
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: gurl_crawler_redis
+    command: >
+      sh -c "
+      if [ \"$$REDIS_PERSIST_DISK\" = \"true\" ]; then
+        redis-server --save ${REDIS_SAVE_FREQUENCY:-300} 1 --appendonly ${REDIS_AOF_ENABLED:-yes} --maxmemory ${REDIS_MAX_MEMORY:-256mb} --maxmemory-policy allkeys-lru
+      else
+        redis-server --save \"\" --appendonly no --maxmemory ${REDIS_MAX_MEMORY:-256mb} --maxmemory-policy allkeys-lru
+      fi
+      "
+    environment:
+      - REDIS_PERSIST_DISK=${REDIS_PERSIST_DISK:-false}
+      - REDIS_SAVE_FREQUENCY=${REDIS_SAVE_FREQUENCY:-300}
+      - REDIS_AOF_ENABLED=${REDIS_AOF_ENABLED:-yes}
+      - REDIS_MAX_MEMORY=${REDIS_MAX_MEMORY:-256mb}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+    driver: local

@@ -1,0 +1,16 @@
+# Binarios y ejecutables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+crawler
+
+# Entorno de Go
+go.work
+go.work.sum
+
+# Archivos del sistema
+.DS_Store
