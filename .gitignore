@@ -6,7 +6,7 @@
 *.dylib
 *.test
 *.out
-crawler
+/crawler
 
 # Entorno de Go
 go.work

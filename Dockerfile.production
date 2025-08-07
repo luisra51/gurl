@@ -21,9 +21,6 @@ COPY . .
 # Tidy modules to ensure consistency
 RUN go mod tidy
 
-# Debug: List files to see what's available
-RUN ls -la && ls -la cmd/ || echo "cmd directory not found"
-
 # Build the application with optimizations for production
 # Create a static binary that works across different architectures
 RUN cd cmd/crawler && \
