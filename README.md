@@ -368,6 +368,7 @@ We welcome contributions! Here's how you can help:
 ### **Using Docker Hub Image (Production)**
 
 [![Docker Hub](https://img.shields.io/docker/v/luisra51/gurl?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/luisra51/gurl)
+[![Docker Pulls](https://img.shields.io/docker/pulls/luisra51/gurl?logo=docker)](https://hub.docker.com/r/luisra51/gurl)
 
 ```bash
 # Single container (no Redis persistence)
