@@ -23,9 +23,10 @@ RUN go mod tidy
 
 # Build the application with optimizations for production
 # Create a static binary that works across different architectures
-RUN CGO_ENABLED=0 GOOS=linux \
+RUN cd cmd/crawler && \
+    CGO_ENABLED=0 GOOS=linux \
     go build -a -installsuffix cgo -ldflags="-w -s" \
-    -o /app/crawler email-crawler/cmd/crawler
+    -o /app/crawler .
 
 # --- Production Stage ---
 FROM alpine:3.18
