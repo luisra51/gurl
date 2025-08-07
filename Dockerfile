@@ -12,7 +12,7 @@ COPY . .
 RUN go mod tidy
 
 # Compila la aplicación creando un binario estático.
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app/crawler ./cmd/crawler
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app/crawler ./cmd/crawler/main.go
 
 # --- Etapa de producción ---
 FROM alpine:latest
