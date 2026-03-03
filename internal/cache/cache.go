@@ -14,11 +14,13 @@ import (
 	"github.com/go-redis/redis/v8"
 
 	"email-crawler/internal/config"
+	"email-crawler/internal/crawler"
 )
 
 type CachedResult struct {
-	Emails    []string  `json:"emails"`
-	Timestamp time.Time `json:"timestamp"`
+	Emails         []string                `json:"emails"`
+	SocialProfiles []crawler.SocialProfile `json:"social_profiles,omitempty"`
+	Timestamp      time.Time               `json:"timestamp"`
 	CrawlInfo struct {
 		Depth        int `json:"depth"`
 		PagesVisited int `json:"pages_visited"`
@@ -30,6 +32,7 @@ type CacheManager struct {
 	config    *config.Config
 	ctx       context.Context
 	enabled   bool
+	testData   map[string]*CachedResult
 }
 
 func NewCacheManager(cfg *config.Config) *CacheManager {
@@ -88,6 +91,10 @@ func (cm *CacheManager) generateKey(rawURL string) string {
 }
 
 func (cm *CacheManager) Get(rawURL string) (*CachedResult, bool) {
+	if cm != nil && cm.testData != nil {
+		result, ok := cm.testData[rawURL]
+		return result, ok
+	}
 	if !cm.enabled {
 		return nil, false
 	}
@@ -111,7 +118,19 @@ func (cm *CacheManager) Get(rawURL string) (*CachedResult, bool) {
 	return &result, true
 }
 
-func (cm *CacheManager) Set(rawURL string, emails []string, depth int, pagesVisited int) error {
+func (cm *CacheManager) Set(rawURL string, emails []string, socialProfiles []crawler.SocialProfile, depth int, pagesVisited int) error {
+	if cm != nil && cm.testData != nil {
+		cm.testData[rawURL] = &CachedResult{
+			Emails:         cm.DeduplicateEmails(emails),
+			SocialProfiles: socialProfiles,
+			Timestamp:      time.Now(),
+			CrawlInfo: struct {
+				Depth        int `json:"depth"`
+				PagesVisited int `json:"pages_visited"`
+			}{Depth: depth, PagesVisited: pagesVisited},
+		}
+		return nil
+	}
 	if !cm.enabled {
 		return nil
 	}
@@ -120,8 +139,9 @@ func (cm *CacheManager) Set(rawURL string, emails []string, depth int, pagesVisi
 	deduplicatedEmails := cm.DeduplicateEmails(emails)
 
 	result := CachedResult{
-		Emails:    deduplicatedEmails,
-		Timestamp: time.Now(),
+		Emails:         deduplicatedEmails,
+		SocialProfiles: socialProfiles,
+		Timestamp:      time.Now(),
 		CrawlInfo: struct {
 			Depth        int `json:"depth"`
 			PagesVisited int `json:"pages_visited"`
@@ -147,7 +167,18 @@ func (cm *CacheManager) Set(rawURL string, emails []string, depth int, pagesVisi
 	return nil
 }
 
+func (cm *CacheManager) SetInMemoryResultForTest(rawURL string, result *CachedResult) {
+	if cm.testData == nil {
+		cm.testData = make(map[string]*CachedResult)
+	}
+	cm.testData[rawURL] = result
+}
+
 func (cm *CacheManager) DeduplicateEmails(emails []string) []string {
+	if cm == nil || cm.config == nil {
+		return emails
+	}
+
 	if !cm.config.DeduplicateEmails {
 		return emails
 	}

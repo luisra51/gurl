@@ -8,8 +8,10 @@ import (
 
 type Config struct {
 	// Crawler settings
-	MaxDepth           int  `json:"max_depth"`
-	DeduplicateEmails  bool `json:"deduplicate_emails"`
+	MaxDepth           int   `json:"max_depth"`
+	DeduplicateEmails  bool  `json:"deduplicate_emails"`
+	MaxResponseBytes   int64 `json:"max_response_bytes"`
+	MaxPagesVisited    int   `json:"max_pages_visited"`
 
 	// Cache settings
 	CacheEnabled        bool          `json:"cache_enabled"`
@@ -36,8 +38,12 @@ type Config struct {
 	RedisMaxMemory     string `json:"redis_max_memory"`
 
 	// Server settings
-	ServerPort string `json:"server_port"`
-	ServerHost string `json:"server_host"`
+	ServerPort              string        `json:"server_port"`
+	ServerHost              string        `json:"server_host"`
+	ServerReadHeaderTimeout time.Duration `json:"server_read_header_timeout"`
+	ServerReadTimeout       time.Duration `json:"server_read_timeout"`
+	ServerWriteTimeout      time.Duration `json:"server_write_timeout"`
+	ServerIdleTimeout       time.Duration `json:"server_idle_timeout"`
 }
 
 func Load() *Config {
@@ -45,6 +51,8 @@ func Load() *Config {
 		// Crawler settings
 		MaxDepth:          getEnvAsInt("CRAWLER_MAX_DEPTH", 3),
 		DeduplicateEmails: getEnvAsBool("CRAWLER_DEDUPLICATE_EMAILS", true),
+		MaxResponseBytes:  getEnvAsInt64("CRAWLER_MAX_RESPONSE_BYTES", 1024*1024),
+		MaxPagesVisited:   getEnvAsInt("CRAWLER_MAX_PAGES_VISITED", 50),
 
 		// Cache settings
 		CacheEnabled:        getEnvAsBool("CACHE_ENABLED", true),
@@ -71,8 +79,12 @@ func Load() *Config {
 		RedisMaxMemory:     getEnv("REDIS_MAX_MEMORY", "256mb"),
 
 		// Server settings
-		ServerPort: getEnv("SERVER_PORT", "8080"),
-		ServerHost: getEnv("SERVER_HOST", "0.0.0.0"),
+		ServerPort:              getEnv("SERVER_PORT", "8080"),
+		ServerHost:              getEnv("SERVER_HOST", "0.0.0.0"),
+		ServerReadHeaderTimeout: time.Duration(getEnvAsInt("SERVER_READ_HEADER_TIMEOUT_SECONDS", 5)) * time.Second,
+		ServerReadTimeout:       time.Duration(getEnvAsInt("SERVER_READ_TIMEOUT_SECONDS", 15)) * time.Second,
+		ServerWriteTimeout:      time.Duration(getEnvAsInt("SERVER_WRITE_TIMEOUT_SECONDS", 30)) * time.Second,
+		ServerIdleTimeout:       time.Duration(getEnvAsInt("SERVER_IDLE_TIMEOUT_SECONDS", 60)) * time.Second,
 	}
 }
 
@@ -91,6 +103,15 @@ func getEnv(key, defaultValue string) string {
 func getEnvAsInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvAsInt64(key string, defaultValue int64) int64 {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.ParseInt(value, 10, 64); err == nil {
 			return intValue
 		}
 	}

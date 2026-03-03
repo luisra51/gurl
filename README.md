@@ -9,7 +9,7 @@
 
 # GURL - Go URL Email Crawler
 
-**An intelligent web crawler built in Go that extracts email addresses from websites with precision and speed.**
+**An intelligent web crawler built in Go that extracts email addresses and social profiles from websites with precision and speed.**
 
 [![Go Version](https://img.shields.io/badge/go-1.22+-00ADD8?style=for-the-badge&logo=go)](https://golang.org/)
 [![Docker](https://img.shields.io/badge/docker-supported-2496ED?style=for-the-badge&logo=docker)](https://www.docker.com/)
@@ -26,9 +26,13 @@
 - **⚡ Redis Cache**: Smart caching with 12-month persistence and 5,400x speed improvement
 - **🚀 Async Processing**: Background jobs with webhook notifications
 - **🔍 Auto Deduplication**: Automatically removes duplicate emails
+- **🌐 Social Discovery**: Extracts social profile links from known platforms
 - **🐳 Dockerized**: Easy deployment with Docker Compose
 - **📡 REST API**: Both synchronous and asynchronous endpoints
 - **⚙️ Configurable Depth**: Explore up to 3 levels deep (configurable)
+- **🛡️ Input Guardrails**: Accepts only absolute HTTP/HTTPS URLs
+- **📏 Crawl Limits**: Restricts per-page response size and total pages visited
+- **♻️ Async Recovery**: Requeues interrupted processing jobs on restart
 
 ## ☕ Support
 
@@ -73,6 +77,8 @@ docker-compose up --build
 
 Service will be available at `http://localhost:8080`
 
+The service assumes authentication, authorization, and rate limiting are handled by an upstream gateway or internal platform layer.
+
 #### **Synchronous Scanning (Immediate Response)**
 ```bash
 # Basic scan
@@ -86,6 +92,15 @@ curl "http://localhost:8080/scan?url=https://company.com"
 ```json
 {
   "emails": ["info@example.com", "contact@example.com"],
+  "social_profiles": [
+    {
+      "platform": "linkedin",
+      "url": "https://linkedin.com/company/example",
+      "handle": "example",
+      "source_page": "https://company.com",
+      "confidence": "high"
+    }
+  ],
   "from_cache": false,
   "crawl_time": "2.3s"
 }
@@ -121,6 +136,15 @@ curl -X POST "http://localhost:8080/scan/async" \
   "status": "completed",
   "url": "https://slow-website.com",
   "emails": ["contact@slow-website.com"],
+  "social_profiles": [
+    {
+      "platform": "instagram",
+      "url": "https://instagram.com/slow-website",
+      "handle": "slow-website",
+      "source_page": "https://slow-website.com",
+      "confidence": "high"
+    }
+  ],
   "crawl_time": "45.2s",
   "pages_visited": 15,
   "completed_at": "2025-08-07T10:30:00Z"
@@ -133,6 +157,7 @@ curl -X POST "http://localhost:8080/scan/async" \
 ```json
 {
   "emails": ["info@example.com", "contact@example.com"],
+  "social_profiles": [],
   "from_cache": true,
   "crawl_time": "396µs"
 }
@@ -184,7 +209,7 @@ The crawler intelligently recognizes contact-related keywords in **6 languages**
 |--------|----------|-------------|
 | `POST` | `/scan/async` | Create async scan job |
 | `GET` | `/scan/status/<job_id>` | Check job status |
-| `DELETE` | `/scan/cancel/<job_id>` | Cancel queued job |
+| `DELETE` | `/scan/cancel/<job_id>` | Cancel queued or processing job |
 | `GET` | `/scan/jobs` | View active job statistics |
 
 ### **Advanced Usage Examples**
@@ -213,7 +238,9 @@ curl -X DELETE "http://localhost:8080/cache/invalidate"
 ```bash
 # Crawler Settings
 CRAWLER_MAX_DEPTH=3                    # Maximum crawling depth
-CRAWLER_DEDUPLICATE_EMAILS=true       # Remove duplicate emails
+CRAWLER_DEDUPLICATE_EMAILS=true        # Remove duplicate emails
+CRAWLER_MAX_RESPONSE_BYTES=1048576     # Max bytes read per page (1 MiB)
+CRAWLER_MAX_PAGES_VISITED=50           # Max pages visited per crawl
 
 # Cache Settings  
 CACHE_ENABLED=true                     # Enable Redis cache
@@ -232,16 +259,43 @@ REDIS_PERSIST_DISK=false              # Disk persistence (prod: true)
 
 # Server Configuration
 SERVER_PORT=8080                       # Server port
-SERVER_HOST=0.0.0.0                   # Server host
+SERVER_HOST=0.0.0.0                    # Server host
+SERVER_READ_HEADER_TIMEOUT_SECONDS=5   # Read header timeout
+SERVER_READ_TIMEOUT_SECONDS=15         # Full request read timeout
+SERVER_WRITE_TIMEOUT_SECONDS=30        # Response write timeout
+SERVER_IDLE_TIMEOUT_SECONDS=60         # Keep-alive idle timeout
 ```
 
 ### **How It Works**
 
 - **🎯 Smart Crawling**: Prioritizes contact pages with multilingual keywords
 - **📊 Depth Control**: Configurable depth (default: 3 levels)
+- **📏 Resource Limits**: Parses only HTML, caps page size, and caps total pages visited
+- **🌐 Social Platforms**: LinkedIn, X/Twitter, Instagram, Facebook, YouTube, TikTok, GitHub, Telegram, WhatsApp, Linktree
 - **⚡ Cache System**: Redis-based caching with 12-month TTL
 - **🔄 Auto Deduplication**: Automatic email normalization and deduplication
 - **🚀 Performance**: 5,400x faster responses with cache hits
+- **♻️ Restart Recovery**: Async jobs left in `processing` are requeued on startup
+
+## Input Rules
+
+- Scan targets must resolve to absolute `http://` or `https://` URLs.
+- Async webhook targets must also be absolute `http://` or `https://` URLs.
+- Bare domains such as `example.com` are normalized to `https://example.com`.
+
+## Social Profiles
+
+Each discovered social profile includes:
+
+- `platform`: normalized platform name
+- `url`: canonical normalized profile URL
+- `handle`: optional value derived from the URL path
+- `source_page`: crawled page where the link was found
+- `confidence`: simple heuristic signal (`high`, `medium`, `low`)
+
+## TODO
+
+- Improve social profile quality heuristics with more platform-specific filters, canonicalization rules, and confidence signals.
 
 ## 🏗️ Project Architecture
 
@@ -433,4 +487,3 @@ docker-compose logs -f redis
 # Enter container for debugging
 docker-compose exec crawler-app sh
 ```
-

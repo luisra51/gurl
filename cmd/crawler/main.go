@@ -38,6 +38,13 @@ func main() {
 
 	if cfg.AsyncEnabled {
 		jobQueue = jobs.NewQueue(redisClient, cfg)
+		requeued, err := jobQueue.RecoverInterruptedJobs()
+		if err != nil {
+			log.Fatalf("failed to recover interrupted jobs: %v", err)
+		}
+		if requeued > 0 {
+			log.Printf("Requeued %d interrupted jobs on startup", requeued)
+		}
 		workerPool = jobs.NewWorkerPool(jobQueue, cacheManager, cfg)
 		workerPool.Start()
 
@@ -91,7 +98,7 @@ func main() {
 		fmt.Printf("\n=== Async Endpoints ===\n")
 		fmt.Printf("POST   /scan/async          - Queue async scan job\n")
 		fmt.Printf("GET    /scan/status/<id>    - Check job status\n")
-		fmt.Printf("DELETE /scan/cancel/<id>    - Cancel queued job\n")
+			fmt.Printf("DELETE /scan/cancel/<id>    - Cancel queued or processing job\n")
 		fmt.Printf("GET    /scan/jobs           - List active jobs\n")
 	}
 
@@ -106,7 +113,16 @@ func main() {
 
 	fmt.Printf("=============================\n\n")
 
-	log.Fatal(http.ListenAndServe(address, nil))
+	server := &http.Server{
+		Addr:              address,
+		Handler:           nil,
+		ReadHeaderTimeout: cfg.ServerReadHeaderTimeout,
+		ReadTimeout:       cfg.ServerReadTimeout,
+		WriteTimeout:      cfg.ServerWriteTimeout,
+		IdleTimeout:       cfg.ServerIdleTimeout,
+	}
+
+	log.Fatal(server.ListenAndServe())
 }
 
 func setupGracefulShutdown(workerPool *jobs.WorkerPool) {

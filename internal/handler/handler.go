@@ -16,10 +16,11 @@ import (
 )
 
 type ScanResponse struct {
-	Emails     []string `json:"emails,omitempty"`
-	Error      string   `json:"error,omitempty"`
-	FromCache  bool     `json:"from_cache"`
-	CrawlTime  string   `json:"crawl_time,omitempty"`
+	Emails         []string                `json:"emails,omitempty"`
+	SocialProfiles []crawler.SocialProfile `json:"social_profiles,omitempty"`
+	Error          string                  `json:"error,omitempty"`
+	FromCache      bool                    `json:"from_cache"`
+	CrawlTime      string                  `json:"crawl_time,omitempty"`
 }
 
 type Handler struct {
@@ -47,12 +48,9 @@ func (h *Handler) ScanHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !strings.HasPrefix(queryURL, "http://") && !strings.HasPrefix(queryURL, "https://") {
-		queryURL = "https://" + queryURL
-	}
-
-	startURL, err := url.Parse(queryURL)
-	if err != nil || (startURL.Scheme != "http" && startURL.Scheme != "https") {
+	queryURL = normalizeTargetURL(queryURL)
+	startURL, err := validateHTTPURL(queryURL)
+	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(ScanResponse{Error: "Invalid URL provided"})
 		return
@@ -61,11 +59,12 @@ func (h *Handler) ScanHandler(w http.ResponseWriter, r *http.Request) {
 	// Check cache first
 	if cachedResult, found := h.cacheManager.Get(queryURL); found {
 		crawlTime := time.Since(startTime)
-		response := ScanResponse{
-			Emails:    cachedResult.Emails,
-			FromCache: true,
-			CrawlTime: crawlTime.String(),
-		}
+			response := ScanResponse{
+				Emails:         cachedResult.Emails,
+				SocialProfiles: cachedResult.SocialProfiles,
+				FromCache:      true,
+				CrawlTime:      crawlTime.String(),
+			}
 		if len(cachedResult.Emails) == 0 {
 			response.Emails = []string{} // Ensure [] instead of null
 		}
@@ -74,16 +73,12 @@ func (h *Handler) ScanHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Not in cache, perform crawl
-	c := crawler.New(h.config.MaxDepth)
-	foundEmailsMap := c.Crawl(startURL)
-
-	emailList := make([]string, 0, len(foundEmailsMap))
-	for email := range foundEmailsMap {
-		emailList = append(emailList, email)
-	}
+	c := crawler.NewWithOptions(h.config.MaxDepth, h.config.MaxResponseBytes, h.config.MaxPagesVisited)
+	crawlResult := c.CrawlResults(r.Context(), startURL)
+	emailList := crawlResult.Emails
 
 	// Cache the result (includes deduplication)
-	h.cacheManager.Set(queryURL, emailList, h.config.MaxDepth, len(foundEmailsMap))
+	h.cacheManager.Set(queryURL, emailList, crawlResult.SocialProfiles, h.config.MaxDepth, crawlResult.PagesVisited)
 
 	// Get deduplicated emails from cache (it was just cached)
 	var deduplicatedEmails []string
@@ -96,9 +91,10 @@ func (h *Handler) ScanHandler(w http.ResponseWriter, r *http.Request) {
 
 	crawlTime := time.Since(startTime)
 	response := ScanResponse{
-		Emails:    deduplicatedEmails,
-		FromCache: false,
-		CrawlTime: crawlTime.String(),
+		Emails:         deduplicatedEmails,
+		SocialProfiles: crawlResult.SocialProfiles,
+		FromCache:      false,
+		CrawlTime:      crawlTime.String(),
 	}
 	if len(deduplicatedEmails) == 0 {
 		response.Emails = []string{} // Ensure [] instead of null
@@ -190,22 +186,19 @@ func (h *Handler) AsyncScanHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	// Validate URL format
-	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
-		req.URL = "https://" + req.URL
-	}
-	
-	if _, err := url.Parse(req.URL); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid URL format"})
-		return
-	}
-	
-	// Validate webhook URL format
-	if _, err := url.Parse(req.WebhookURL); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid webhook_url format"})
-		return
-	}
+		req.URL = normalizeTargetURL(req.URL)
+		if _, err := validateHTTPURL(req.URL); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid URL format"})
+			return
+		}
+		
+		// Validate webhook URL format
+		if _, err := validateHTTPURL(req.WebhookURL); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid webhook_url format"})
+			return
+		}
 	
 	// Enqueue job
 	job, err := h.jobQueue.Enqueue(req)
@@ -226,6 +219,34 @@ func (h *Handler) AsyncScanHandler(w http.ResponseWriter, r *http.Request) {
 	
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(response)
+}
+
+func normalizeTargetURL(rawURL string) string {
+	if parsed, err := url.Parse(rawURL); err == nil && parsed.Scheme != "" {
+		return rawURL
+	}
+
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		return "https://" + rawURL
+	}
+	return rawURL
+}
+
+func validateHTTPURL(rawURL string) (*url.URL, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported scheme")
+	}
+
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("missing host")
+	}
+
+	return parsed, nil
 }
 
 func (h *Handler) JobStatusHandler(w http.ResponseWriter, r *http.Request) {

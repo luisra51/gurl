@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"email-crawler/internal/cache"
@@ -22,6 +24,8 @@ type WorkerPool struct {
 	workers      []chan bool
 	ctx          context.Context
 	cancel       context.CancelFunc
+	cancelMu     sync.Mutex
+	jobCancels   map[string]context.CancelFunc
 }
 
 func NewWorkerPool(queue *Queue, cacheManager *cache.CacheManager, config *config.Config) *WorkerPool {
@@ -34,11 +38,13 @@ func NewWorkerPool(queue *Queue, cacheManager *cache.CacheManager, config *confi
 		workers:      make([]chan bool, config.AsyncWorkers),
 		ctx:          ctx,
 		cancel:       cancel,
+		jobCancels:   make(map[string]context.CancelFunc),
 	}
 }
 
 func (wp *WorkerPool) Start() {
 	log.Printf("Starting %d async workers", wp.config.AsyncWorkers)
+	wp.queue.SetJobCanceller(wp.cancelJob)
 	
 	for i := 0; i < wp.config.AsyncWorkers; i++ {
 		wp.workers[i] = make(chan bool)
@@ -97,7 +103,7 @@ func (wp *WorkerPool) processJob(workerID int, job *ScanJob) {
 		log.Printf("Worker %d: cache hit for job %s", workerID, job.ID)
 		
 		crawlTime := time.Since(startTime).String()
-		err := wp.queue.CompleteJob(job, cachedResult.Emails, cachedResult.CrawlInfo.PagesVisited, crawlTime)
+		err := wp.queue.CompleteJob(job, cachedResult.Emails, cachedResult.SocialProfiles, cachedResult.CrawlInfo.PagesVisited, crawlTime)
 		if err != nil {
 			log.Printf("Worker %d: failed to complete cached job %s: %v", workerID, job.ID, err)
 			wp.queue.FailJob(job, fmt.Sprintf("Failed to complete job: %v", err))
@@ -122,31 +128,44 @@ func (wp *WorkerPool) processJob(workerID int, job *ScanJob) {
 	defer crawlerCancel()
 	
 	// Perform crawl
-	c := crawler.New(wp.config.MaxDepth)
-	
-	// TODO: Add context support to crawler for cancellation
-	// For now, we'll rely on the timeout
-	foundEmailsMap := c.Crawl(startURL)
-	
-	// Check if context was cancelled
-	select {
-	case <-crawlerCtx.Done():
-		log.Printf("Worker %d: job %s timed out", workerID, job.ID)
-		wp.queue.FailJob(job, "Job timed out")
+	c := crawler.NewWithOptions(wp.config.MaxDepth, wp.config.MaxResponseBytes, wp.config.MaxPagesVisited)
+	wp.registerJobCancel(job.ID, crawlerCancel)
+	defer wp.unregisterJobCancel(job.ID)
+
+	crawlResult := c.CrawlResults(crawlerCtx, startURL)
+
+	if err := crawlerCtx.Err(); err != nil {
+		latestJob, getErr := wp.queue.GetJob(job.ID)
+		if getErr == nil {
+			job = latestJob
+		}
+
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			log.Printf("Worker %d: job %s timed out", workerID, job.ID)
+			if job.Status != StatusCancelled {
+				if failErr := wp.queue.FailJob(job, "Job timed out"); failErr != nil {
+					log.Printf("Worker %d: failed to mark timed out job %s: %v", workerID, job.ID, failErr)
+				}
+			}
+		case errors.Is(err, context.Canceled):
+			log.Printf("Worker %d: job %s cancelled", workerID, job.ID)
+		}
+
+		latestJob, getErr = wp.queue.GetJob(job.ID)
+		if getErr == nil {
+			job = latestJob
+		}
+
 		wp.sendWebhook(workerID, job)
 		return
-	default:
-		// Continue processing
 	}
 	
 	// Convert map to slice
-	emailList := make([]string, 0, len(foundEmailsMap))
-	for email := range foundEmailsMap {
-		emailList = append(emailList, email)
-	}
+	emailList := crawlResult.Emails
 	
 	// Cache the result
-	wp.cacheManager.Set(job.URL, emailList, wp.config.MaxDepth, len(foundEmailsMap))
+	wp.cacheManager.Set(job.URL, emailList, crawlResult.SocialProfiles, wp.config.MaxDepth, crawlResult.PagesVisited)
 	
 	// Get deduplicated emails
 	deduplicatedEmails := wp.cacheManager.DeduplicateEmails(emailList)
@@ -154,7 +173,7 @@ func (wp *WorkerPool) processJob(workerID int, job *ScanJob) {
 	crawlTime := time.Since(startTime).String()
 	
 	// Complete job
-	err = wp.queue.CompleteJob(job, deduplicatedEmails, len(foundEmailsMap), crawlTime)
+	err = wp.queue.CompleteJob(job, deduplicatedEmails, crawlResult.SocialProfiles, crawlResult.PagesVisited, crawlTime)
 	if err != nil {
 		log.Printf("Worker %d: failed to complete job %s: %v", workerID, job.ID, err)
 		wp.queue.FailJob(job, fmt.Sprintf("Failed to complete job: %v", err))
@@ -165,6 +184,30 @@ func (wp *WorkerPool) processJob(workerID int, job *ScanJob) {
 	
 	// Send webhook
 	wp.sendWebhook(workerID, job)
+}
+
+func (wp *WorkerPool) registerJobCancel(jobID string, cancel context.CancelFunc) {
+	wp.cancelMu.Lock()
+	defer wp.cancelMu.Unlock()
+	wp.jobCancels[jobID] = cancel
+}
+
+func (wp *WorkerPool) unregisterJobCancel(jobID string) {
+	wp.cancelMu.Lock()
+	defer wp.cancelMu.Unlock()
+	delete(wp.jobCancels, jobID)
+}
+
+func (wp *WorkerPool) cancelJob(jobID string) bool {
+	wp.cancelMu.Lock()
+	cancel, ok := wp.jobCancels[jobID]
+	wp.cancelMu.Unlock()
+	if !ok {
+		return false
+	}
+
+	cancel()
+	return true
 }
 
 func (wp *WorkerPool) sendWebhook(workerID int, job *ScanJob) {
@@ -179,6 +222,7 @@ func (wp *WorkerPool) sendWebhook(workerID int, job *ScanJob) {
 		Status:       job.Status,
 		URL:          job.URL,
 		Emails:       job.Emails,
+		SocialProfiles: job.SocialProfiles,
 		CrawlTime:    job.CrawlTime,
 		PagesVisited: job.PagesVisited,
 		CompletedAt:  time.Now(),

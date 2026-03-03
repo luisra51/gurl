@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 
 	"email-crawler/internal/config"
+	"email-crawler/internal/crawler"
 )
 
 const (
@@ -20,9 +22,11 @@ const (
 )
 
 type Queue struct {
-	client *redis.Client
-	config *config.Config
-	ctx    context.Context
+	client       *redis.Client
+	config       *config.Config
+	ctx          context.Context
+	mu           sync.RWMutex
+	jobCanceller func(string) bool
 }
 
 func NewQueue(client *redis.Client, config *config.Config) *Queue {
@@ -31,6 +35,12 @@ func NewQueue(client *redis.Client, config *config.Config) *Queue {
 		config: config,
 		ctx:    context.Background(),
 	}
+}
+
+func (q *Queue) SetJobCanceller(canceller func(string) bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.jobCanceller = canceller
 }
 
 func (q *Queue) Enqueue(req AsyncScanRequest) (*ScanJob, error) {
@@ -142,11 +152,12 @@ func (q *Queue) UpdateJob(job *ScanJob) error {
 	return nil
 }
 
-func (q *Queue) CompleteJob(job *ScanJob, emails []string, pagesVisited int, crawlTime string) error {
+func (q *Queue) CompleteJob(job *ScanJob, emails []string, socialProfiles []crawler.SocialProfile, pagesVisited int, crawlTime string) error {
 	now := time.Now()
 	job.Status = StatusCompleted
 	job.CompletedAt = &now
 	job.Emails = emails
+	job.SocialProfiles = socialProfiles
 	job.PagesVisited = pagesVisited
 	job.CrawlTime = crawlTime
 
@@ -185,7 +196,13 @@ func (q *Queue) CancelJob(jobID string) error {
 	}
 
 	if job.Status == StatusProcessing {
-		return fmt.Errorf("cannot cancel job that is currently processing")
+		q.mu.RLock()
+		canceller := q.jobCanceller
+		q.mu.RUnlock()
+
+		if canceller == nil || !canceller(jobID) {
+			return fmt.Errorf("cannot cancel job that is currently processing")
+		}
 	}
 
 	now := time.Now()
@@ -235,4 +252,40 @@ func (q *Queue) Stats() map[string]interface{} {
 	}
 
 	return stats
+}
+
+func (q *Queue) RecoverInterruptedJobs() (int, error) {
+	activeJobs, err := q.GetActiveJobs()
+	if err != nil {
+		return 0, err
+	}
+
+	requeued := 0
+	for _, jobID := range activeJobs {
+		job, err := q.GetJob(jobID)
+		if err != nil {
+			continue
+		}
+
+		if job.Status != StatusProcessing {
+			continue
+		}
+
+		job.Status = StatusQueued
+		job.StartedAt = nil
+		job.CompletedAt = nil
+		job.Error = ""
+		job.CrawlTime = ""
+		if err := q.UpdateJob(job); err != nil {
+			return requeued, err
+		}
+
+		if err := q.client.LPush(q.ctx, QueueKey, jobID).Err(); err != nil {
+			return requeued, err
+		}
+
+		requeued++
+	}
+
+	return requeued, nil
 }
