@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -115,6 +116,8 @@ type Crawler struct {
 	visited          map[string]bool
 	emails           map[string]bool
 	socialProfiles   map[string]SocialProfile
+	phones           map[string]Phone
+	organizations    []Organization
 	baseURL          *url.URL
 	client           *http.Client
 }
@@ -131,7 +134,8 @@ func NewWithOptions(maxDepth int, maxResponseBytes int64, maxPagesVisited int) *
 		visited:          make(map[string]bool),
 		emails:           make(map[string]bool),
 		socialProfiles:   make(map[string]SocialProfile),
-		client:           &http.Client{},
+		phones:           make(map[string]Phone),
+		client:           &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -164,9 +168,19 @@ func (c *Crawler) CrawlResults(ctx context.Context, startURL *url.URL) CrawlResu
 		return profiles[i].Platform < profiles[j].Platform
 	})
 
+	phones := make([]Phone, 0, len(c.phones))
+	for _, p := range c.phones {
+		phones = append(phones, p)
+	}
+	sort.Slice(phones, func(i, j int) bool {
+		return phones[i].Number < phones[j].Number
+	})
+
 	return CrawlResult{
 		Emails:         emails,
 		SocialProfiles: profiles,
+		Phones:         phones,
+		Organizations:  c.organizations,
 		PagesVisited:   c.pagesVisited,
 	}
 }
@@ -240,6 +254,11 @@ func (c *Crawler) crawlRecursive(ctx context.Context, u *url.URL, depth int) {
 	for _, email := range foundEmails {
 		c.emails[strings.ToLower(email)] = true
 	}
+
+	// Structured data comes first so JSON-LD phones get the "high"
+	// confidence slot before the text-pass lowers it with "low".
+	c.extractStructured(doc, u)
+	c.extractPhones(doc, u)
 
 	doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
 		href, exists := s.Attr("href")

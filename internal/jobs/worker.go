@@ -18,19 +18,20 @@ import (
 )
 
 type WorkerPool struct {
-	queue        *Queue
-	cacheManager *cache.CacheManager
-	config       *config.Config
-	workers      []chan bool
-	ctx          context.Context
-	cancel       context.CancelFunc
-	cancelMu     sync.Mutex
-	jobCancels   map[string]context.CancelFunc
+	queue         *Queue
+	cacheManager  *cache.CacheManager
+	config        *config.Config
+	workers       []chan bool
+	ctx           context.Context
+	cancel        context.CancelFunc
+	cancelMu      sync.Mutex
+	jobCancels    map[string]context.CancelFunc
+	webhookClient *http.Client
 }
 
 func NewWorkerPool(queue *Queue, cacheManager *cache.CacheManager, config *config.Config) *WorkerPool {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	return &WorkerPool{
 		queue:        queue,
 		cacheManager: cacheManager,
@@ -39,6 +40,9 @@ func NewWorkerPool(queue *Queue, cacheManager *cache.CacheManager, config *confi
 		ctx:          ctx,
 		cancel:       cancel,
 		jobCancels:   make(map[string]context.CancelFunc),
+		webhookClient: &http.Client{
+			Timeout: config.AsyncWebhookTimeout,
+		},
 	}
 }
 
@@ -101,9 +105,9 @@ func (wp *WorkerPool) processJob(workerID int, job *ScanJob) {
 	// Check cache first
 	if cachedResult, found := wp.cacheManager.Get(job.URL); found {
 		log.Printf("Worker %d: cache hit for job %s", workerID, job.ID)
-		
+
 		crawlTime := time.Since(startTime).String()
-		err := wp.queue.CompleteJob(job, cachedResult.Emails, cachedResult.SocialProfiles, cachedResult.CrawlInfo.PagesVisited, crawlTime)
+		err := wp.queue.CompleteJob(job, cachedResult.Emails, cachedResult.SocialProfiles, cachedResult.Phones, cachedResult.Organizations, cachedResult.CrawlInfo.PagesVisited, crawlTime)
 		if err != nil {
 			log.Printf("Worker %d: failed to complete cached job %s: %v", workerID, job.ID, err)
 			wp.queue.FailJob(job, fmt.Sprintf("Failed to complete job: %v", err))
@@ -163,17 +167,17 @@ func (wp *WorkerPool) processJob(workerID int, job *ScanJob) {
 	
 	// Convert map to slice
 	emailList := crawlResult.Emails
-	
+
 	// Cache the result
-	wp.cacheManager.Set(job.URL, emailList, crawlResult.SocialProfiles, wp.config.MaxDepth, crawlResult.PagesVisited)
-	
+	wp.cacheManager.Set(job.URL, emailList, crawlResult.SocialProfiles, crawlResult.Phones, crawlResult.Organizations, wp.config.MaxDepth, crawlResult.PagesVisited)
+
 	// Get deduplicated emails
 	deduplicatedEmails := wp.cacheManager.DeduplicateEmails(emailList)
-	
+
 	crawlTime := time.Since(startTime).String()
-	
+
 	// Complete job
-	err = wp.queue.CompleteJob(job, deduplicatedEmails, crawlResult.SocialProfiles, crawlResult.PagesVisited, crawlTime)
+	err = wp.queue.CompleteJob(job, deduplicatedEmails, crawlResult.SocialProfiles, crawlResult.Phones, crawlResult.Organizations, crawlResult.PagesVisited, crawlTime)
 	if err != nil {
 		log.Printf("Worker %d: failed to complete job %s: %v", workerID, job.ID, err)
 		wp.queue.FailJob(job, fmt.Sprintf("Failed to complete job: %v", err))
@@ -217,16 +221,18 @@ func (wp *WorkerPool) sendWebhook(workerID int, job *ScanJob) {
 	}
 	
 	payload := WebhookPayload{
-		JobID:        job.ID,
-		CallbackID:   job.CallbackID,
-		Status:       job.Status,
-		URL:          job.URL,
-		Emails:       job.Emails,
+		JobID:          job.ID,
+		CallbackID:     job.CallbackID,
+		Status:         job.Status,
+		URL:            job.URL,
+		Emails:         job.Emails,
 		SocialProfiles: job.SocialProfiles,
-		CrawlTime:    job.CrawlTime,
-		PagesVisited: job.PagesVisited,
-		CompletedAt:  time.Now(),
-		Error:        job.Error,
+		Phones:         job.Phones,
+		Organizations:  job.Organizations,
+		CrawlTime:      job.CrawlTime,
+		PagesVisited:   job.PagesVisited,
+		CompletedAt:    time.Now(),
+		Error:          job.Error,
 	}
 	
 	jsonData, err := json.Marshal(payload)
@@ -237,46 +243,54 @@ func (wp *WorkerPool) sendWebhook(workerID int, job *ScanJob) {
 	
 	// Try webhook delivery with retries
 	for attempt := 1; attempt <= wp.config.AsyncWebhookRetries; attempt++ {
-		log.Printf("Worker %d: sending webhook for job %s (attempt %d/%d)", 
+		log.Printf("Worker %d: sending webhook for job %s (attempt %d/%d)",
 			workerID, job.ID, attempt, wp.config.AsyncWebhookRetries)
-		
-		client := &http.Client{
-			Timeout: wp.config.AsyncWebhookTimeout,
-		}
-		
-		resp, err := client.Post(job.WebhookURL, "application/json", bytes.NewBuffer(jsonData))
+
+		resp, err := wp.webhookClient.Post(job.WebhookURL, "application/json", bytes.NewBuffer(jsonData))
 		if err != nil {
-			log.Printf("Worker %d: webhook attempt %d failed for job %s: %v", 
+			log.Printf("Worker %d: webhook attempt %d failed for job %s: %v",
 				workerID, attempt, job.ID, err)
-			
+
 			if attempt == wp.config.AsyncWebhookRetries {
 				log.Printf("Worker %d: all webhook attempts failed for job %s", workerID, job.ID)
 				return
 			}
-			
-			// Exponential backoff
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+
+			time.Sleep(webhookBackoff(attempt))
 			continue
 		}
-		
+
 		resp.Body.Close()
-		
+
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			log.Printf("Worker %d: webhook delivered successfully for job %s (status: %d)", 
+			log.Printf("Worker %d: webhook delivered successfully for job %s (status: %d)",
 				workerID, job.ID, resp.StatusCode)
 			return
 		}
-		
-		log.Printf("Worker %d: webhook attempt %d returned status %d for job %s", 
+
+		log.Printf("Worker %d: webhook attempt %d returned status %d for job %s",
 			workerID, attempt, resp.StatusCode, job.ID)
-		
+
 		if attempt == wp.config.AsyncWebhookRetries {
-			log.Printf("Worker %d: webhook failed with status %d for job %s", 
+			log.Printf("Worker %d: webhook failed with status %d for job %s",
 				workerID, resp.StatusCode, job.ID)
 			return
 		}
-		
-		// Exponential backoff
-		time.Sleep(time.Duration(attempt) * 2 * time.Second)
+
+		time.Sleep(webhookBackoff(attempt))
 	}
+}
+
+// webhookBackoff returns an exponential backoff duration capped at 30 seconds.
+// attempt is 1-based: 2s, 4s, 8s, 16s, 30s, 30s...
+func webhookBackoff(attempt int) time.Duration {
+	const maxBackoff = 30 * time.Second
+	if attempt < 1 {
+		attempt = 1
+	}
+	d := time.Duration(1<<attempt) * time.Second
+	if d <= 0 || d > maxBackoff {
+		return maxBackoff
+	}
+	return d
 }

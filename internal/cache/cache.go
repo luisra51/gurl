@@ -20,6 +20,8 @@ import (
 type CachedResult struct {
 	Emails         []string                `json:"emails"`
 	SocialProfiles []crawler.SocialProfile `json:"social_profiles,omitempty"`
+	Phones         []crawler.Phone         `json:"phones,omitempty"`
+	Organizations  []crawler.Organization  `json:"organizations,omitempty"`
 	Timestamp      time.Time               `json:"timestamp"`
 	CrawlInfo struct {
 		Depth        int `json:"depth"`
@@ -27,12 +29,22 @@ type CachedResult struct {
 	} `json:"crawl_info"`
 }
 
+// redisOpTimeout caps individual Redis round trips so a hung Redis cannot
+// stall the crawler's cache lookups.
+const redisOpTimeout = 5 * time.Second
+
 type CacheManager struct {
 	client    *redis.Client
 	config    *config.Config
 	ctx       context.Context
 	enabled   bool
 	testData   map[string]*CachedResult
+}
+
+// opCtx returns a short-lived context for a single Redis operation, derived
+// from the CacheManager's base context so it still honors global cancellation.
+func (cm *CacheManager) opCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(cm.ctx, redisOpTimeout)
 }
 
 func NewCacheManager(cfg *config.Config) *CacheManager {
@@ -100,8 +112,10 @@ func (cm *CacheManager) Get(rawURL string) (*CachedResult, bool) {
 	}
 
 	key := cm.generateKey(rawURL)
-	
-	data, err := cm.client.Get(cm.ctx, key).Result()
+
+	ctx, cancel := cm.opCtx()
+	defer cancel()
+	data, err := cm.client.Get(ctx, key).Result()
 	if err != nil {
 		if err != redis.Nil {
 			log.Printf("Redis GET error: %v", err)
@@ -118,11 +132,13 @@ func (cm *CacheManager) Get(rawURL string) (*CachedResult, bool) {
 	return &result, true
 }
 
-func (cm *CacheManager) Set(rawURL string, emails []string, socialProfiles []crawler.SocialProfile, depth int, pagesVisited int) error {
+func (cm *CacheManager) Set(rawURL string, emails []string, socialProfiles []crawler.SocialProfile, phones []crawler.Phone, organizations []crawler.Organization, depth int, pagesVisited int) error {
 	if cm != nil && cm.testData != nil {
 		cm.testData[rawURL] = &CachedResult{
 			Emails:         cm.DeduplicateEmails(emails),
 			SocialProfiles: socialProfiles,
+			Phones:         phones,
+			Organizations:  organizations,
 			Timestamp:      time.Now(),
 			CrawlInfo: struct {
 				Depth        int `json:"depth"`
@@ -141,6 +157,8 @@ func (cm *CacheManager) Set(rawURL string, emails []string, socialProfiles []cra
 	result := CachedResult{
 		Emails:         deduplicatedEmails,
 		SocialProfiles: socialProfiles,
+		Phones:         phones,
+		Organizations:  organizations,
 		Timestamp:      time.Now(),
 		CrawlInfo: struct {
 			Depth        int `json:"depth"`
@@ -157,8 +175,10 @@ func (cm *CacheManager) Set(rawURL string, emails []string, socialProfiles []cra
 	}
 
 	key := cm.generateKey(rawURL)
-	
-	err = cm.client.Set(cm.ctx, key, data, cm.config.CacheExpirationTime).Err()
+
+	ctx, cancel := cm.opCtx()
+	defer cancel()
+	err = cm.client.Set(ctx, key, data, cm.config.CacheExpirationTime).Err()
 	if err != nil {
 		return fmt.Errorf("failed to set cache: %v", err)
 	}
@@ -212,7 +232,9 @@ func (cm *CacheManager) InvalidateURL(rawURL string) error {
 	}
 
 	key := cm.generateKey(rawURL)
-	return cm.client.Del(cm.ctx, key).Err()
+	ctx, cancel := cm.opCtx()
+	defer cancel()
+	return cm.client.Del(ctx, key).Err()
 }
 
 func (cm *CacheManager) ClearAll() error {
@@ -221,13 +243,17 @@ func (cm *CacheManager) ClearAll() error {
 	}
 
 	// Get all keys matching our pattern
-	keys, err := cm.client.Keys(cm.ctx, "crawler:emails:*").Result()
+	keysCtx, keysCancel := cm.opCtx()
+	keys, err := cm.client.Keys(keysCtx, "crawler:emails:*").Result()
+	keysCancel()
 	if err != nil {
 		return err
 	}
 
 	if len(keys) > 0 {
-		return cm.client.Del(cm.ctx, keys...).Err()
+		delCtx, delCancel := cm.opCtx()
+		defer delCancel()
+		return cm.client.Del(delCtx, keys...).Err()
 	}
 
 	return nil
@@ -243,13 +269,17 @@ func (cm *CacheManager) Stats() map[string]interface{} {
 	}
 
 	// Get Redis info
-	info, err := cm.client.Info(cm.ctx, "memory").Result()
+	infoCtx, infoCancel := cm.opCtx()
+	info, err := cm.client.Info(infoCtx, "memory").Result()
+	infoCancel()
 	if err == nil {
 		stats["redis_info"] = info
 	}
 
 	// Count our keys
-	keys, err := cm.client.Keys(cm.ctx, "crawler:emails:*").Result()
+	keysCtx, keysCancel := cm.opCtx()
+	keys, err := cm.client.Keys(keysCtx, "crawler:emails:*").Result()
+	keysCancel()
 	if err == nil {
 		stats["cached_urls"] = len(keys)
 	}

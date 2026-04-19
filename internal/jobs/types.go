@@ -31,6 +31,8 @@ type ScanJob struct {
 	// Results
 	Emails         []string                `json:"emails,omitempty"`
 	SocialProfiles []crawler.SocialProfile `json:"social_profiles,omitempty"`
+	Phones         []crawler.Phone         `json:"phones,omitempty"`
+	Organizations  []crawler.Organization  `json:"organizations,omitempty"`
 	PagesVisited   int                     `json:"pages_visited,omitempty"`
 }
 
@@ -49,14 +51,16 @@ type AsyncScanResponse struct {
 }
 
 type WebhookPayload struct {
-	JobID        string    `json:"job_id"`
-	CallbackID   string    `json:"callback_id,omitempty"`
-	Status       JobStatus `json:"status"`
-	URL          string    `json:"url"`
-	Emails       []string                `json:"emails,omitempty"`
+	JobID          string                  `json:"job_id"`
+	CallbackID     string                  `json:"callback_id,omitempty"`
+	Status         JobStatus               `json:"status"`
+	URL            string                  `json:"url"`
+	Emails         []string                `json:"emails,omitempty"`
 	SocialProfiles []crawler.SocialProfile `json:"social_profiles,omitempty"`
-	CrawlTime    string                  `json:"crawl_time,omitempty"`
-	PagesVisited int                     `json:"pages_visited,omitempty"`
-	CompletedAt  time.Time               `json:"completed_at"`
-	Error        string                  `json:"error,omitempty"`
+	Phones         []crawler.Phone         `json:"phones,omitempty"`
+	Organizations  []crawler.Organization  `json:"organizations,omitempty"`
+	CrawlTime      string                  `json:"crawl_time,omitempty"`
+	PagesVisited   int                     `json:"pages_visited,omitempty"`
+	CompletedAt    time.Time               `json:"completed_at"`
+	Error          string                  `json:"error,omitempty"`
 }

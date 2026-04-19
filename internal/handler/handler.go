@@ -9,15 +9,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"email-crawler/internal/cache"
 	"email-crawler/internal/config"
 	"email-crawler/internal/crawler"
 	"email-crawler/internal/jobs"
 )
 
+// maxAsyncScanBodyBytes caps the request body read for /scan/async to prevent
+// memory exhaustion from oversized payloads.
+const maxAsyncScanBodyBytes = 64 * 1024
+
 type ScanResponse struct {
 	Emails         []string                `json:"emails,omitempty"`
 	SocialProfiles []crawler.SocialProfile `json:"social_profiles,omitempty"`
+	Phones         []crawler.Phone         `json:"phones,omitempty"`
+	Organizations  []crawler.Organization  `json:"organizations,omitempty"`
 	Error          string                  `json:"error,omitempty"`
 	FromCache      bool                    `json:"from_cache"`
 	CrawlTime      string                  `json:"crawl_time,omitempty"`
@@ -59,12 +67,14 @@ func (h *Handler) ScanHandler(w http.ResponseWriter, r *http.Request) {
 	// Check cache first
 	if cachedResult, found := h.cacheManager.Get(queryURL); found {
 		crawlTime := time.Since(startTime)
-			response := ScanResponse{
-				Emails:         cachedResult.Emails,
-				SocialProfiles: cachedResult.SocialProfiles,
-				FromCache:      true,
-				CrawlTime:      crawlTime.String(),
-			}
+		response := ScanResponse{
+			Emails:         cachedResult.Emails,
+			SocialProfiles: cachedResult.SocialProfiles,
+			Phones:         cachedResult.Phones,
+			Organizations:  cachedResult.Organizations,
+			FromCache:      true,
+			CrawlTime:      crawlTime.String(),
+		}
 		if len(cachedResult.Emails) == 0 {
 			response.Emails = []string{} // Ensure [] instead of null
 		}
@@ -78,7 +88,7 @@ func (h *Handler) ScanHandler(w http.ResponseWriter, r *http.Request) {
 	emailList := crawlResult.Emails
 
 	// Cache the result (includes deduplication)
-	h.cacheManager.Set(queryURL, emailList, crawlResult.SocialProfiles, h.config.MaxDepth, crawlResult.PagesVisited)
+	h.cacheManager.Set(queryURL, emailList, crawlResult.SocialProfiles, crawlResult.Phones, crawlResult.Organizations, h.config.MaxDepth, crawlResult.PagesVisited)
 
 	// Get deduplicated emails from cache (it was just cached)
 	var deduplicatedEmails []string
@@ -93,6 +103,8 @@ func (h *Handler) ScanHandler(w http.ResponseWriter, r *http.Request) {
 	response := ScanResponse{
 		Emails:         deduplicatedEmails,
 		SocialProfiles: crawlResult.SocialProfiles,
+		Phones:         crawlResult.Phones,
+		Organizations:  crawlResult.Organizations,
 		FromCache:      false,
 		CrawlTime:      crawlTime.String(),
 	}
@@ -157,49 +169,51 @@ func (h *Handler) AsyncScanHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	// Parse request body
+	// Parse request body with size limit to prevent memory exhaustion
+	r.Body = http.MaxBytesReader(w, r.Body, maxAsyncScanBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read request body"})
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Request body too large or unreadable"})
 		return
 	}
-	
+
 	var req jobs.AsyncScanRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON format"})
 		return
 	}
-	
+
 	// Validate required fields
 	if req.URL == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Missing 'url' field"})
 		return
 	}
-	
+
 	if req.WebhookURL == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Missing 'webhook_url' field"})
 		return
 	}
-	
+
 	// Validate URL format
-		req.URL = normalizeTargetURL(req.URL)
-		if _, err := validateHTTPURL(req.URL); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid URL format"})
-			return
-		}
-		
-		// Validate webhook URL format
-		if _, err := validateHTTPURL(req.WebhookURL); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid webhook_url format"})
-			return
-		}
-	
+	req.URL = normalizeTargetURL(req.URL)
+	if _, err := validateHTTPURL(req.URL); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid URL format"})
+		return
+	}
+
+	// Validate webhook URL format
+	if _, err := validateHTTPURL(req.WebhookURL); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid webhook_url format"})
+		return
+	}
+
+
 	// Enqueue job
 	job, err := h.jobQueue.Enqueue(req)
 	if err != nil {
@@ -249,26 +263,39 @@ func validateHTTPURL(rawURL string) (*url.URL, error) {
 	return parsed, nil
 }
 
+// extractJobID pulls the trailing path segment after prefix and validates it as a UUID.
+// Returns the jobID and a nil error on success; otherwise writes an error response and returns err.
+func extractJobID(w http.ResponseWriter, r *http.Request, prefix string) (string, error) {
+	path := strings.TrimPrefix(r.URL.Path, prefix)
+	if path == "" || path == r.URL.Path {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Missing job ID in path"})
+		return "", fmt.Errorf("missing job ID")
+	}
+
+	if _, err := uuid.Parse(path); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid job ID format"})
+		return "", err
+	}
+
+	return path, nil
+}
+
 func (h *Handler) JobStatusHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	
+
 	if !h.config.AsyncEnabled {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Async scanning is disabled"})
 		return
 	}
-	
-	// Extract job ID from URL path
-	// Expected path: /scan/status/{job_id}
-	path := strings.TrimPrefix(r.URL.Path, "/scan/status/")
-	if path == "" || path == r.URL.Path {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Missing job ID in path"})
+
+	jobID, err := extractJobID(w, r, "/scan/status/")
+	if err != nil {
 		return
 	}
-	
-	jobID := path
-	
+
 	// Get job from queue
 	job, err := h.jobQueue.GetJob(jobID)
 	if err != nil {
@@ -294,20 +321,14 @@ func (h *Handler) CancelJobHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed. Use DELETE."})
 		return
 	}
-	
-	// Extract job ID from URL path
-	// Expected path: /scan/cancel/{job_id}
-	path := strings.TrimPrefix(r.URL.Path, "/scan/cancel/")
-	if path == "" || path == r.URL.Path {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Missing job ID in path"})
+
+	jobID, err := extractJobID(w, r, "/scan/cancel/")
+	if err != nil {
 		return
 	}
-	
-	jobID := path
-	
+
 	// Cancel job
-	err := h.jobQueue.CancelJob(jobID)
+	err = h.jobQueue.CancelJob(jobID)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Failed to cancel job: %v", err)})
