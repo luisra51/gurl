@@ -2,7 +2,7 @@
 # This file is used by GitHub Actions to build and publish the Docker image
 
 # --- Build Stage ---
-FROM golang:1.22-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 # Install git and ca-certificates (needed for go modules)
 RUN apk add --no-cache git ca-certificates
